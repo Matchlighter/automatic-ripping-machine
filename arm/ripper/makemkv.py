@@ -24,6 +24,14 @@ class MakeMkvRuntimeError(RuntimeError):
         raise super().__init__(self.message)
 
 
+def makemkv_cmd(job, mounts=[]):
+    devs = find_disc_devices(job.devpath)
+    dev_params = [f"--device {dev}" for dev in devs]
+    mount_params = [f"-v {mnt}" for mnt in mounts]
+    params = " ".join([*dev_params, *mount_params])
+    return f"docker run --rm {params} jlesage/makemkv /opt/makemkv/bin/makemkvcon"
+
+
 def makemkv(logfile, job):
     """
     Rip Blu-rays/DVDs with MakeMKV\n\n
@@ -36,35 +44,24 @@ def makemkv(logfile, job):
     # confirm MKV is working, beta key hasn't expired
     prep_mkv(job)
     logging.info(f"Starting MakeMKV rip. Method is {job.config.RIPMETHOD}")
-    # get MakeMKV disc number
-    logging.debug("Getting MakeMKV disc number")
-    cmd = f"makemkvcon -r info disc:9999  |grep {job.devpath} |grep -oP '(?<=:).*?(?=,)'"
-    try:
-        mdisc = subprocess.check_output(
-            cmd,
-            shell=True
-        ).decode("utf-8")
-        logging.info(f"MakeMKV disc number: {mdisc.strip()}")
-    except subprocess.CalledProcessError as mdisc_error:
-        raise MakeMkvRuntimeError(mdisc_error)
 
     # get filesystem in order
     rawpath = setup_rawpath(job, os.path.join(str(job.config.RAW_PATH), str(job.title)))
+    mnt = f"{os.path.dirname(rawpath)}:{os.path.dirname(rawpath)}"
     logging.info(f"Processing files to: {rawpath}")
     # Rip bluray
     if (job.config.RIPMETHOD == "backup" or job.config.RIPMETHOD == "backup_dvd") and job.disctype == "bluray":
         # backup method
-        cmd = f'makemkvcon backup --minlength={job.config.MINLENGTH} --decrypt {job.config.MKV_ARGS} ' \
-              f'-r disc:{mdisc.strip()} {shlex.quote(rawpath)}>> {logfile}'
+        cmd = f'{makemkv_cmd(job, [mnt])} backup --minlength={job.config.MINLENGTH} --decrypt {job.config.MKV_ARGS} ' \
+              f'-r dev:{job.devpath} {shlex.quote(rawpath)}>> {logfile}'
         logging.info("Backup up disc")
         run_makemkv(cmd)
     # Rip DVD
     elif job.config.RIPMETHOD == "mkv" or job.disctype == "dvd":
-        get_track_info(mdisc, job)
-
+        get_track_info(job)
         # if no maximum length, process the whole disc in one command
         if int(job.config.MAXLENGTH) > 99998:
-            cmd = f'makemkvcon mkv {job.config.MKV_ARGS} -r --progress=-stdout --messages=-stdout ' \
+            cmd = f'{makemkv_cmd(job, [mnt])} mkv {job.config.MKV_ARGS} -r --progress=-stdout --messages=-stdout ' \
                   f'dev:{job.devpath} all {shlex.quote(rawpath)} --minlength={job.config.MINLENGTH}>> {logfile}'
             run_makemkv(cmd)
         else:
@@ -103,7 +100,8 @@ def process_single_tracks(job, logfile, rawpath):
             filepathname = os.path.join(rawpath, track.filename)
             logging.info(f"Ripping title {track.track_number} to {shlex.quote(filepathname)}")
 
-            cmd = f'makemkvcon mkv {job.config.MKV_ARGS} -r --progress=-stdout --messages=-stdout' \
+            mnt = f"{os.path.dirname(rawpath)}:{os.path.dirname(rawpath)}"
+            cmd = f'{makemkv_cmd(job, [mnt])} mkv {job.config.MKV_ARGS} -r --progress=-stdout --messages=-stdout' \
                   f'dev:{job.devpath} {track.track_number} {shlex.quote(rawpath)} ' \
                   f'--minlength={job.config.MINLENGTH}>> {logfile}'
             # Possibly update db to say track was ripped
@@ -147,7 +145,8 @@ def prep_mkv(job):
     """
     logging.info("Prepping MakeMkv for usage...")
 
-    cmd = f"makemkvcon info {job.devpath}"
+    cmd = f"{makemkv_cmd(job)} info {job.devpath}"
+    logging.info(cmd)
     try:
         # check=True is needed to make the exception throw on a non-zero return
         subprocess.run(cmd, capture_output=True, shell=True, check=True)  # noqa: F841
@@ -186,11 +185,22 @@ def update_key():
         raise RuntimeError(err) from update_err
 
 
-def get_track_info(mdisc, job):
+def find_disc_devices(srdev):
+    logging.debug("Determining sgX devices")
+    cmd = f"lsscsi -g -k | grep -w \"cd/dvd\" | tr -s ' ' | grep \"{srdev}\""
+    try:
+        disc_info = subprocess.check_output(cmd,shell=True).decode("utf-8")
+        sgdev = disc_info.strip().split(" ")[-1]
+        logging.info(f"{srdev} <-> {sgdev}")
+        return [srdev, sgdev]
+    except subprocess.CalledProcessError as mdisc_error:
+        raise MakeMkvRuntimeError(mdisc_error)
+
+
+def get_track_info(job):
     """
     Use MakeMKV to get track info and update Track class
 
-    :param mdisc: MakeMKV disc number
     :param job: Job instance
     :return: None
 
@@ -200,8 +210,8 @@ def get_track_info(mdisc, job):
 
     logging.info("Using MakeMKV to get information on all the tracks on the disc. This will take a few minutes...")
 
-    cmd = f'makemkvcon -r --progress=-stdout --messages=-stdout --minlength={job.config.MINLENGTH} ' \
-          f'--cache=1 info disc:{mdisc}'
+    cmd = f'{makemkv_cmd(job)} -r --progress=-stdout --messages=-stdout --minlength={job.config.MINLENGTH} ' \
+          f'--cache=1 info dev:{job.devpath}'
     logging.debug(f"Sending command: {cmd}")
     try:
         mkv = subprocess.check_output(
